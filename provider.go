@@ -232,3 +232,74 @@ func (p *Provider) GetKlines(symbols []string, category uint16, count uint16) []
 
 	return results
 }
+
+// TdxQuote 批量实时行情单条记录（来自 cmdSecurityQuotes 五档命令）
+type TdxQuote struct {
+	Market    int
+	Code      string  // 6 位代码
+	Name      string  // 名称（需另取，本结构默认空）
+	Price     float64 // 最新价
+	Open      float64 // 今开
+	High      float64 // 最高
+	Low       float64 // 最低
+	LastClose float64 // 昨收
+	Volume    float64 // 成交量
+	Amount    float64 // 成交额
+}
+
+// GetQuotesBatch 批量获取实时行情（按市场分组各调用一次 GetQuotes）。
+// 返回结果按 6 位代码聚合，调用方再据此做价格兜底（price=0 → 昨收）。
+func (p *Provider) GetQuotesBatch(symbols []string) ([]TdxQuote, error) {
+	p.mu.Lock()
+	if !p.connected || p.client == nil {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("TDX Provider 未连接")
+	}
+	client := p.client
+	p.mu.Unlock()
+
+	sh, sz := make([]string, 0), make([]string, 0)
+	for _, sym := range symbols {
+		if ResolveMarket(sym) == MarketSH {
+			sh = append(sh, sym)
+		} else {
+			sz = append(sz, sym)
+		}
+	}
+
+	var out []TdxQuote
+	if len(sh) > 0 {
+		if q, err := client.GetQuotes(uint16(MarketSH), sh); err == nil {
+			for _, x := range q {
+				out = append(out, tdxQuoteFrom(x))
+			}
+		} else if p.debug {
+			log.Printf("[TDX] 批量行情(沪)失败: %v", err)
+		}
+	}
+	if len(sz) > 0 {
+		if q, err := client.GetQuotes(uint16(MarketSZ), sz); err == nil {
+			for _, x := range q {
+				out = append(out, tdxQuoteFrom(x))
+			}
+		} else if p.debug {
+			log.Printf("[TDX] 批量行情(深)失败: %v", err)
+		}
+	}
+	return out, nil
+}
+
+func tdxQuoteFrom(q QuoteData) TdxQuote {
+	return TdxQuote{
+		Market:    q.Market,
+		Code:      q.Code,
+		Name:      q.Name,
+		Price:     q.Price,
+		Open:      q.Open,
+		High:      q.High,
+		Low:       q.Low,
+		LastClose: q.LastClose,
+		Volume:    q.Volume,
+		Amount:    q.Amount,
+	}
+}
