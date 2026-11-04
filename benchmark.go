@@ -3,23 +3,33 @@ package tdx
 
 import (
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 // 已知通达信行情服务器列表
+//
+// 注意：公共行情主站（101.227.73.20 / 114.80.149.92 / 202.108.253.131 / 180.153.18.170 等）
+// 近年已被大面积封锁——TCP 能连上但行情请求一律返回空体，无法取到数据。
+// 这里改为使用券商（方正证券）专属行情主站，与桌面版小方客户端 connect.cfg 一致。
+// 已在本机 pytdx 实测可取到真实行情的服务器排在前面。
+// 也可用环境变量 TDX_HQ_SERVERS（格式 host:port,host:port,...）覆盖本清单。
 var KnownServers = []ServerAddr{
-	{"上海电信", "101.227.73.20", 7709},
-	{"上海电信2", "101.226.10.92", 7709},
-	{"深圳电信", "114.80.149.92", 7709},
-	{"北京联通", "123.125.108.90", 7709},
-	{"广州电信", "221.194.181.81", 7709},
-	{"通达信主站", "202.108.253.131", 7709},
-	{"深圳行情", "119.147.212.81", 7709},
-	{"上海行情", "180.153.18.170", 7709},
-	{"上海行情2", "180.153.18.171", 7709},
-	{"上海行情3", "103.2.234.199", 7709},
+	{"方正证券-长沙一", "124.232.133.136", 7709}, // 实测可用
+	{"方正证券-长沙联通一", "110.53.177.135", 7709}, // 实测可用
+	{"方正证券-长沙移动一", "111.23.148.7", 7709},   // 实测可用
+	{"方正证券数据中心", "hq1.foundersc.com", 7709},
+	{"方正证券-证通一", "101.226.9.232", 7709},
+	{"方正证券-证通二", "175.6.5.151", 7709},
+	{"方正证券-证通通信一", "123.125.108.55", 7709},
+	{"方正证券-证通通信二", "182.118.47.184", 7709},
+	{"方正证券-长沙二", "175.6.30.71", 7709},
+	{"方正证券-长沙联通二", "110.53.162.71", 7709},
+	{"方正证券-长沙移动二", "111.23.148.73", 7709},
 }
 
 // ServerAddr 服务器地址
@@ -37,6 +47,34 @@ type BenchmarkResult struct {
 	Error   error
 }
 
+// loadServers 返回用于测速的服务器列表：默认使用 KnownServers，
+// 若设置了环境变量 TDX_HQ_SERVERS（格式 "host:port,host:port,..."）则以其为准。
+func loadServers() []ServerAddr {
+	env := os.Getenv("TDX_HQ_SERVERS")
+	if strings.TrimSpace(env) == "" {
+		return KnownServers
+	}
+	var out []ServerAddr
+	for i, item := range strings.Split(env, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		host := item
+		port := 7709
+		if h, p, ok := strings.Cut(item, ":"); ok && p != "" {
+			if pv, err := strconv.Atoi(p); err == nil {
+				host, port = h, pv
+			}
+		}
+		out = append(out, ServerAddr{Name: fmt.Sprintf("ENV-%d", i), Host: host, Port: port})
+	}
+	if len(out) == 0 {
+		return KnownServers
+	}
+	return out
+}
+
 // Benchmark 对已知服务器列表进行测速
 // 返回按延迟排序的结果列表
 func Benchmark(timeout time.Duration) []BenchmarkResult {
@@ -44,7 +82,7 @@ func Benchmark(timeout time.Duration) []BenchmarkResult {
 	var mu sync.Mutex
 	var results []BenchmarkResult
 
-	for _, addr := range KnownServers {
+	for _, addr := range loadServers() {
 		wg.Add(1)
 		go func(a ServerAddr) {
 			defer wg.Done()

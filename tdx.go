@@ -1,8 +1,13 @@
 // go-tdx/tdx.go — 通达信 TCP 协议客户端
 //
-// 基于 pytdx/mootdx 的协议分析实现
-// 直连通达信行情服务器 7709 端口
-// 支持：K线数据 (日/周/月/分钟)、实时行情 (五档)
+// 协议严格对齐 pytdx（实测抓包 + 源码核对）：
+//   - 登录握手：连接后依次发送 3 个 setup 包，消费掉服务器回包，否则首个行情请求会被断开。
+//   - 请求帧：单帧 struct.pack("<HIHHHH6sHHHHIIH" / "<HIHHIIHH+<B6s>...")，无额外 16 字节封装。
+//   - 响应帧：16 字节头 + 体；体长度取 header[12:14](uint16 zipsize)，
+//     header[14:16] 为 unzipsize；zipsize != unzipsize 时体为 zlib 压缩，需解压。
+//   - 行情/分时均以"差异增量"编码（get_price 变长整数），价格按 /1000（K线）或 /100（实时）还原。
+//
+// 直连通达信行情服务器 7709 端口，支持 K线（日/周/月/分钟）与实时五档行情。
 package tdx
 
 import (
@@ -11,7 +16,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,41 +43,33 @@ const (
 	CategoryKLine15Min = 1  // 15分钟K线
 	CategoryKLine30Min = 2  // 30分钟K线
 	CategoryKLine1Hour = 3  // 1小时K线
-	CategoryKLineDay   = 4  // 日K线 (pytdx 主用)
+	CategoryKLineDay   = 4  // 日K线 (pytdx/mootdx 主用, 方正证券主站实测可用)
 	CategoryKLineWeek  = 5  // 周K线
 	CategoryKLineMonth = 6  // 月K线
 	CategoryKLine1Min  = 7  // 1分钟K线
-	CategoryKLineDay9  = 9  // 日K线 (pytdx 备选/高版本)
+	CategoryKLineDay9  = 9  // 日K线 (部分服务端/国际版)
 	CategoryKLineQtr   = 10 // 季K线
 	CategoryKLineYear  = 11 // 年K线
-)
-
-// 命令 ID
-const (
-	cmdSecurityBars   = 1 // 获取K线数据
-	cmdSecurityCount  = 2 // 获取K线数量
-	cmdSecurityQuotes = 4 // 获取实时行情 (命令字与 pytdx 对齐)
-	cmdSecurityList   = 5 // 获取股票列表
 )
 
 // ── 数据结构 ────────────────────────────────────────────────────────────────
 
 // KlineBar 单根K线
 type KlineBar struct {
-	Date   string  // 日期，格式 YYYYMMDD (或 YYYYMMDDHHMM)
+	Date   string  // 日期，日线 YYYYMMDD；分钟线 YYYYMMDDHHMM
 	Open   float64
 	High   float64
 	Low    float64
 	Close  float64
 	Amount float64 // 成交额 (元)
-	Volume float64 // 成交量 (股)
+	Volume float64 // 成交量 (股/手)
 }
 
 // QuoteData 实时行情 (五档)
 type QuoteData struct {
 	Market     int
 	Code       string
-	Name       string  // 股票名称 (需从其他接口获取)
+	Name       string  // 股票名称 (本协议不含名称)
 	Price      float64 // 最新价
 	LastClose  float64 // 昨收
 	Open       float64 // 今开
@@ -81,7 +80,7 @@ type QuoteData struct {
 	BuyPrices  [5]float64
 	BuyVolumes [5]float64
 	SellPrices [5]float64
-	SellVolumes[5]float64
+	SellVolumes [5]float64
 }
 
 // ServerInfo 服务器测速信息
@@ -101,7 +100,6 @@ type Client struct {
 	host     string
 	port     int
 	timeout  time.Duration
-	seqID    uint16
 	bestHost string
 	bestPort int
 }
@@ -117,7 +115,7 @@ func NewClient(host string, port int) *Client {
 	}
 }
 
-// Connect 建立连接
+// Connect 建立连接（含 TDX 登录握手）
 func (c *Client) Connect() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -132,7 +130,41 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("连接通达信服务器 %s 失败: %w", addr, err)
 	}
 	c.conn = conn
-	c.seqID = 0
+
+	// TDX 登录握手：部分券商行情服务器要求在发送任何行情请求前先完成握手，
+	// 否则会在首个数据请求时直接断开连接（表现为 EOF）。包内容来自 pytdx 实测抓包。
+	if err := c.setupHandshake(); err != nil {
+		c.conn.Close()
+		c.conn = nil
+		return fmt.Errorf("TDX 握手失败: %w", err)
+	}
+	return nil
+}
+
+// tdxHandshakePackets TDX 登录握手包（来自 pytdx 实测抓包，连接后必须依次发送）
+var tdxHandshakePackets = [][]byte{
+	{0x0c, 0x02, 0x18, 0x93, 0x00, 0x01, 0x03, 0x00, 0x03, 0x00, 0x0d, 0x00, 0x01},
+	{0x0c, 0x02, 0x18, 0x94, 0x00, 0x01, 0x03, 0x00, 0x03, 0x00, 0x0d, 0x00, 0x02},
+	{
+		0x0c, 0x03, 0x18, 0x99, 0x00, 0x01, 0x20, 0x00, 0x20, 0x00,
+		0xdb, 0x0f, 0xd5, 0xd0, 0xc9, 0xcc, 0xd6, 0xa4, 0xa8, 0xaf,
+		0x00, 0x00, 0x00, 0x8f, 0xc2, 0x25, 0x40, 0x13, 0x00, 0x00,
+		0xd5, 0x00, 0xc9, 0xcc, 0xbd, 0xf0, 0xd7, 0xea, 0x00, 0x00, 0x00, 0x02,
+	},
+}
+
+// setupHandshake 发送 TDX 登录握手包并消费服务器响应，保持 TCP 流同步。
+func (c *Client) setupHandshake() error {
+	c.conn.SetDeadline(time.Now().Add(c.timeout))
+	for _, pkt := range tdxHandshakePackets {
+		if _, err := c.conn.Write(pkt); err != nil {
+			return fmt.Errorf("发送握手包失败: %w", err)
+		}
+		// 读取并丢弃服务器响应（16 字节头 + 体），避免流错位
+		if _, err := c.readResponse(); err != nil {
+			return fmt.Errorf("接收握手响应失败: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -153,23 +185,10 @@ func (c *Client) IsConnected() bool {
 	return c.conn != nil
 }
 
-// ── 核心协议 ────────────────────────────────────────────────────────────────
+// ── 底层收发 ─────────────────────────────────────────────────────────────────
 
-// sendPacket 发送请求包并接收响应
-//
-// 通达信协议帧格式 (发送):
-//
-//	[0-1]  uint16 magic (0x0c01 = body不压缩; 0x0c02 = body用zlib压缩)
-//	[2-3]  uint16 zipped_length   (压缩后的 body 长度)
-//	[4-5]  uint16 unzipped_length (压缩前的 body 长度)
-//	[6-7]  uint16 seq_id
-//	[8-9]  uint16 cmd_group
-//	[10-11]uint16 cmd
-//	[12-13]uint16 sub_cmd / market
-//	[14-15]uint16 reserved
-//
-//	然后可选跟 body (可能zlib压缩)
-func (c *Client) sendPacket(cmdGroup uint16, cmd uint16, subCmd uint16, body []byte) ([]byte, error) {
+// sendRaw 发送整帧请求并读取响应（16 字节头 + 体，按 pytdx 协议解压）。
+func (c *Client) sendRaw(pkg []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -177,69 +196,19 @@ func (c *Client) sendPacket(cmdGroup uint16, cmd uint16, subCmd uint16, body []b
 		return nil, fmt.Errorf("未连接到服务器")
 	}
 
-	c.seqID++
-
-	// 构建 header (16 字节)
-	// 如果 body 非空则尝试压缩
-	var zipLen, unzipLen uint16
-	var bodyData []byte
-
-	if len(body) > 0 {
-		unzipLen = uint16(len(body))
-
-		// zlib 压缩
-		var buf bytes.Buffer
-		w := zlib.NewWriter(&buf)
-		if _, err := w.Write(body); err != nil {
-			return nil, fmt.Errorf("压缩body失败: %w", err)
-		}
-		w.Close()
-		bodyData = buf.Bytes()
-		zipLen = uint16(len(bodyData))
-	} else {
-		bodyData = nil
-		zipLen = 0
-		unzipLen = 0
-	}
-
-	// 使用 0x0c01 (不压缩) 或 0x0c02 (zlib压缩)?
-	// 如果 body < 256 字节则不压缩，否则压缩
-	magic := uint16(0x0c01)
-	if len(bodyData) < len(body) {
-		magic = 0x0c02
-	} else {
-		// 不压缩，使用原始 body
-		bodyData = body
-		zipLen = uint16(len(body))
-		unzipLen = uint16(len(body))
-	}
-
-	header := make([]byte, headSize)
-	binary.LittleEndian.PutUint16(header[0:2], magic)
-	binary.LittleEndian.PutUint16(header[2:4], zipLen)
-	binary.LittleEndian.PutUint16(header[4:6], unzipLen)
-	binary.LittleEndian.PutUint16(header[6:8], c.seqID)
-	binary.LittleEndian.PutUint16(header[8:10], cmdGroup)
-	binary.LittleEndian.PutUint16(header[10:12], cmd)
-	binary.LittleEndian.PutUint16(header[12:14], subCmd)
-	binary.LittleEndian.PutUint16(header[14:16], 0)
-
-	// 发送 header + body
 	c.conn.SetDeadline(time.Now().Add(c.timeout))
-	if _, err := c.conn.Write(header); err != nil {
+	if _, err := c.conn.Write(pkg); err != nil {
 		c.conn.Close()
 		c.conn = nil
-		return nil, fmt.Errorf("发送header失败: %w", err)
+		return nil, fmt.Errorf("发送请求失败: %w", err)
 	}
-	if len(bodyData) > 0 {
-		if _, err := c.conn.Write(bodyData); err != nil {
-			c.conn.Close()
-			c.conn = nil
-			return nil, fmt.Errorf("发送body失败: %w", err)
-		}
-	}
+	return c.readResponse()
+}
 
-	// 接收响应 header
+// readResponse 读取一次 TDX 响应：16 字节头 + 体。
+// header 布局（小端）：<IIIHH → [0:4]魔法 [4:8] [8:12] [12:14]zipsize [14:16]unzipsize。
+// 当 zipsize != unzipsize 时，体为 zlib 压缩，需解压。
+func (c *Client) readResponse() ([]byte, error) {
 	respHeader := make([]byte, headSize)
 	c.conn.SetDeadline(time.Now().Add(c.timeout))
 	if _, err := io.ReadFull(c.conn, respHeader); err != nil {
@@ -248,39 +217,145 @@ func (c *Client) sendPacket(cmdGroup uint16, cmd uint16, subCmd uint16, body []b
 		return nil, fmt.Errorf("接收响应header失败: %w", err)
 	}
 
-	respZipLen := binary.LittleEndian.Uint16(respHeader[2:4])
-	respUnzipLen := binary.LittleEndian.Uint16(respHeader[4:6])
+	zipsize := binary.LittleEndian.Uint16(respHeader[12:14])
+	unzipsize := binary.LittleEndian.Uint16(respHeader[14:16])
 
-	if respUnzipLen == 0 {
+	if zipsize == 0 {
 		return nil, nil
 	}
 
-	// 接收响应 body
-	respBody := make([]byte, respZipLen)
-	c.conn.SetDeadline(time.Now().Add(c.timeout))
-	if _, err := io.ReadFull(c.conn, respBody); err != nil {
+	body := make([]byte, zipsize)
+	if _, err := io.ReadFull(c.conn, body); err != nil {
 		c.conn.Close()
 		c.conn = nil
 		return nil, fmt.Errorf("接收响应body失败: %w", err)
 	}
 
-	// 判断是否需要解压
-	respMagic := binary.LittleEndian.Uint16(respHeader[0:2])
-	if respMagic == 0x0c02 && respUnzipLen != respZipLen {
-		// zlib 解压
-		r, err := zlib.NewReader(bytes.NewReader(respBody))
+	if zipsize != unzipsize {
+		r, err := zlib.NewReader(bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("创建解压器失败: %w", err)
 		}
 		defer r.Close()
-		uncompressed := make([]byte, respUnzipLen)
-		if _, err := io.ReadFull(r, uncompressed); err != nil {
+		out, err := io.ReadAll(r)
+		if err != nil {
 			return nil, fmt.Errorf("解压响应失败: %w", err)
 		}
-		return uncompressed, nil
+		return out, nil
+	}
+	return body, nil
+}
+
+// ── 协议解码辅助（对齐 pytdx/helper.py）────────────────────────────────────
+
+// getPrice 解析变长带符号整数（1~n 字节，对齐 pytdx helper.get_price）。
+// 每个字节：低 6 位为数据；0x40 为符号位；0x80 为续字节标志（后续每字节低 7 位累加）。
+func getPrice(data []byte, pos int) (int, int) {
+	if pos >= len(data) {
+		return 0, pos
+	}
+	posByte := 6
+	bdata := int(data[pos])
+	intdata := bdata & 0x3f
+	sign := (bdata & 0x40) != 0
+
+	if bdata&0x80 != 0 {
+		for {
+			pos++
+			if pos >= len(data) {
+				break
+			}
+			bdata = int(data[pos])
+			intdata += (bdata & 0x7f) << posByte
+			posByte += 7
+			if bdata&0x80 == 0 {
+				break
+			}
+		}
+	}
+	pos++
+	if sign {
+		intdata = -intdata
+	}
+	return intdata, pos
+}
+
+// getPriceAt 读取一个变长整数并就地前移位置指针（避免调用处用 := 意外遮蔽外层 pos）。
+func getPriceAt(data []byte, pos *int) int {
+	v, p := getPrice(data, *pos)
+	*pos = p
+	return v
+}
+
+// getDatetime 解析 K 线时间戳（对齐 pytdx helper.get_datetime）。
+// category<4 或 ==7 或 ==8 为分钟线，日期+时间打包在 4 字节；其余为日线，4 字节即 YYYYMMDD。
+func getDatetime(category uint16, data []byte, pos int) (int, int, int, int, int, int) {
+	year, month, day, hour, minute := 0, 0, 0, 15, 0
+	if category < 4 || category == 7 || category == 8 {
+		zipday := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+		tminutes := int(binary.LittleEndian.Uint16(data[pos+2 : pos+4]))
+		year = (zipday >> 11) + 2004
+		month = (zipday % 2048) / 100
+		day = (zipday % 2048) % 100
+		hour = tminutes / 60
+		minute = tminutes % 60
+	} else {
+		zipday := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
+		year = zipday / 10000
+		month = (zipday % 10000) / 100
+		day = zipday % 100
+	}
+	pos += 4
+	return year, month, day, hour, minute, pos
+}
+
+// getVolume 还原成交量/成交额（对齐 pytdx helper.get_volume 的自定义浮点解码）。
+// 注意：并非标准 IEEE-754；例如原始值 0 会得到约 5.877e-39。必须逐位还原以保证与 pytdx 一致。
+func getVolume(ivol uint32) float64 {
+	logpoint := ivol >> 24
+	hleax := (ivol >> 16) & 0xff
+	lheax := (ivol >> 8) & 0xff
+	lleax := ivol & 0xff
+
+	dwEcx := int(logpoint)*2 - 0x7f
+	dwEdx := int(logpoint)*2 - 0x86
+	dwEsi := int(logpoint)*2 - 0x8e
+	dwEax := int(logpoint)*2 - 0x96
+
+	tmpEax := dwEcx
+	if dwEcx < 0 {
+		tmpEax = -dwEcx
 	}
 
-	return respBody, nil
+	dblXmm6 := math.Pow(2.0, float64(tmpEax))
+	if dwEcx < 0 {
+		dblXmm6 = 1.0 / dblXmm6
+	}
+
+	var dblXmm4 float64
+	if hleax > 0x80 {
+		dwtmpeax := dwEdx + 1
+		tmpdblXmm3 := math.Pow(2.0, float64(dwtmpeax))
+		dblXmm0 := math.Pow(2.0, float64(dwEdx))*128.0 + float64(hleax&0x7f)*tmpdblXmm3
+		dblXmm4 = dblXmm0
+	} else {
+		var dblXmm0 float64
+		if dwEdx >= 0 {
+			dblXmm0 = math.Pow(2.0, float64(dwEdx)) * float64(hleax)
+		} else {
+			dblXmm0 = (1.0 / math.Pow(2.0, float64(dwEdx))) * float64(hleax)
+		}
+		dblXmm4 = dblXmm0
+	}
+
+	dblXmm3 := math.Pow(2.0, float64(dwEsi)) * float64(lheax)
+	dblXmm1 := math.Pow(2.0, float64(dwEax)) * float64(lleax)
+	if hleax&0x80 != 0 {
+		dblXmm3 *= 2.0
+		dblXmm1 *= 2.0
+	}
+
+	return dblXmm6 + dblXmm4 + dblXmm3 + dblXmm1
 }
 
 // ── K线数据 ──────────────────────────────────────────────────────────────────
@@ -293,79 +368,89 @@ func (c *Client) sendPacket(cmdGroup uint16, cmd uint16, subCmd uint16, body []b
 //	start:    起始位置 (0=最新)
 //	count:    获取数量 (最大 800)
 func (c *Client) GetKline(category uint16, market uint16, code string, start uint16, count uint16) ([]KlineBar, error) {
-	// 构建 body: category(2) + market(2) + code(6) + start(2) + count(2) = 14 字节
+	codeBytes := make([]byte, 6)
+	copy(codeBytes, []byte(code))
+
+	// 对齐 pytdx GetSecurityBarsCmd: struct.pack("<HIHHHH6sHHHHIIH", ...)
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.LittleEndian, category)
-	binary.Write(buf, binary.LittleEndian, market)
+	binary.Write(buf, binary.LittleEndian, uint16(0x10c))
+	binary.Write(buf, binary.LittleEndian, uint32(0x01016408))
+	binary.Write(buf, binary.LittleEndian, uint16(0x1c))
+	binary.Write(buf, binary.LittleEndian, uint16(0x1c))
+	binary.Write(buf, binary.LittleEndian, uint16(0x052d))
+	binary.Write(buf, binary.LittleEndian, uint16(market))
+	buf.Write(codeBytes)
+	binary.Write(buf, binary.LittleEndian, uint16(category))
+	binary.Write(buf, binary.LittleEndian, uint16(1))
+	binary.Write(buf, binary.LittleEndian, uint16(start))
+	binary.Write(buf, binary.LittleEndian, uint16(count))
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	binary.Write(buf, binary.LittleEndian, uint16(0))
 
-	// code: 固定 6 字节，不足补 0
-	codeBytes := []byte(code)
-	codePad := make([]byte, 6)
-	copy(codePad, codeBytes)
-	binary.Write(buf, binary.LittleEndian, codePad)
-
-	binary.Write(buf, binary.LittleEndian, start)
-	binary.Write(buf, binary.LittleEndian, count)
-
-	// command: cmdGroup=0x01, cmd=0x01, subCmd=market
-	resp, err := c.sendPacket(0x01, cmdSecurityBars, market, buf.Bytes())
+	resp, err := c.sendRaw(buf.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("获取K线失败 [%s]: %w", code, err)
 	}
-
-	return parseKlineBars(resp, count)
+	return parseKlineBars(resp, category)
 }
 
-// parseKlineBars 解析K线数据
-//
-// 通达信每根K线 32 字节:
-//
-//	[0-3]  uint32  date (YYYYMMDD)
-//	[4-7]  uint32  open   (乘以100后的价格，单位：分)
-//	[8-11] uint32  high
-//	[12-15] uint32 low
-//	[16-19] uint32 close
-//	[20-23] float32 amount (成交额)
-//	[24-27] uint32  volume (成交量)
-//	[28-31] uint32  reserved
-func parseKlineBars(data []byte, expectedCount uint16) ([]KlineBar, error) {
-	const barSize = 32
-
-	if len(data) == 0 {
+// parseKlineBars 解析 K 线数据（对齐 pytdx GetSecurityBarsCmd.parseResponse）
+func parseKlineBars(data []byte, category uint16) ([]KlineBar, error) {
+	if len(data) < 2 {
 		return nil, fmt.Errorf("K线响应数据为空")
 	}
 
-	n := len(data) / barSize
-	if n == 0 {
-		return nil, fmt.Errorf("K线数据长度不足以解析")
-	}
+	retCount := int(binary.LittleEndian.Uint16(data[0:2]))
+	pos := 2
 
-	bars := make([]KlineBar, 0, n)
+	bars := make([]KlineBar, 0, retCount)
+	preDiffBase := 0
 
-	for i := 0; i < n; i++ {
-		off := i * barSize
-		if off+barSize > len(data) {
+	for i := 0; i < retCount; i++ {
+		if pos+4 > len(data) {
 			break
 		}
-		raw := data[off : off+barSize]
+		year, month, day, hour, minute, np := getDatetime(category, data, pos)
+		pos = np
 
-		dateVal := binary.LittleEndian.Uint32(raw[0:4])
-		openVal := binary.LittleEndian.Uint32(raw[4:8])
-		highVal := binary.LittleEndian.Uint32(raw[8:12])
-		lowVal := binary.LittleEndian.Uint32(raw[12:16])
-		closeVal := binary.LittleEndian.Uint32(raw[16:20])
-		amountVal := float64(binary.LittleEndian.Uint32(raw[20:24])) // float32 as uint32 bits
-		volumeVal := binary.LittleEndian.Uint32(raw[24:28])
+		openDiff := getPriceAt(data, &pos)
+		closeDiff := getPriceAt(data, &pos)
+		highDiff := getPriceAt(data, &pos)
+		lowDiff := getPriceAt(data, &pos)
 
-		// 转换价格：分 → 元
+		if pos+8 > len(data) {
+			break
+		}
+		volRaw := binary.LittleEndian.Uint32(data[pos : pos+4])
+		pos += 4
+		dbVolRaw := binary.LittleEndian.Uint32(data[pos : pos+4])
+		pos += 4
+		vol := getVolume(volRaw)
+		amount := getVolume(dbVolRaw)
+
+		openP := float64(openDiff+preDiffBase) / 1000.0
+		newOpenDiff := openDiff + preDiffBase
+		closeP := float64(newOpenDiff+closeDiff) / 1000.0
+		highP := float64(newOpenDiff+highDiff) / 1000.0
+		lowP := float64(newOpenDiff+lowDiff) / 1000.0
+		preDiffBase = newOpenDiff + closeDiff
+
+		var dateStr string
+		if category < 4 || category == 7 || category == 8 {
+			dateStr = fmt.Sprintf("%04d%02d%02d%02d%02d", year, month, day, hour, minute)
+		} else {
+			dateStr = fmt.Sprintf("%04d%02d%02d", year, month, day)
+		}
+
 		bars = append(bars, KlineBar{
-			Date:   fmt.Sprintf("%08d", dateVal),
-			Open:   float64(openVal) / 100.0,
-			High:   float64(highVal) / 100.0,
-			Low:    float64(lowVal) / 100.0,
-			Close:  float64(closeVal) / 100.0,
-			Amount: amountVal,
-			Volume: float64(volumeVal),
+			Date:   dateStr,
+			Open:   openP,
+			Close:  closeP,
+			High:   highP,
+			Low:    lowP,
+			Amount: amount,
+			Volume: vol,
 		})
 	}
 
@@ -374,108 +459,147 @@ func parseKlineBars(data []byte, expectedCount uint16) ([]KlineBar, error) {
 
 // ── 实时行情 ──────────────────────────────────────────────────────────────────
 
-// GetQuotes 获取实时行情
+// GetQuotes 获取实时行情（五档）
 //
 //	market: 市场
-//	codes:  股票代码列表
+//	codes:  股票代码列表（同市场）
 func (c *Client) GetQuotes(market uint16, codes []string) ([]QuoteData, error) {
 	if len(codes) == 0 {
 		return nil, nil
 	}
 
-	// 构建 body: count(2) + for each: market(1) + code(6)
+	// 对齐 pytdx GetSecurityQuotesCmd: struct.pack("<HIHHIIHH", ...) + 每支 struct.pack("<B6s", ...)
+	// 注意格式是 H-I-H-H-I-I-H-H（中间两个 I 连写），共 22 字节头：
+	//   0x10c, 0x02006320, pkgdatalen, pkgdatalen, 0x5053e, 0(I), 0(H), stock_len(H)
+	// 早期写成 uint16(0) 导致第 6 个字段只有 2 字节，整包比正确值少 2 字节、服务器不回包。
+	pkgdatalen := uint16(len(codes)*7 + 12)
 	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.LittleEndian, uint16(0x10c))
+	binary.Write(buf, binary.LittleEndian, uint32(0x02006320))
+	binary.Write(buf, binary.LittleEndian, pkgdatalen)
+	binary.Write(buf, binary.LittleEndian, pkgdatalen)
+	binary.Write(buf, binary.LittleEndian, uint32(0x5053e))
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	binary.Write(buf, binary.LittleEndian, uint16(0))
 	binary.Write(buf, binary.LittleEndian, uint16(len(codes)))
-
-	codeBytes := make([]byte, 6)
 	for _, code := range codes {
-		binary.Write(buf, binary.LittleEndian, uint8(market))
+		codeBytes := make([]byte, 6)
 		copy(codeBytes, []byte(code))
-		binary.Write(buf, binary.LittleEndian, codeBytes)
+		buf.WriteByte(byte(market))
+		buf.Write(codeBytes)
 	}
 
-	resp, err := c.sendPacket(0x01, cmdSecurityQuotes, market, buf.Bytes())
+	resp, err := c.sendRaw(buf.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("获取行情失败: %w", err)
 	}
-
 	return parseQuotes(resp, market, codes)
 }
 
-// parseQuotes 解析实时行情响应
-//
-// 每条行情约 400 字节，包含:
-//
-//	market, code, 名称, 昨收, 今开, 最高, 最低,
-//	最新价, 成交量, 成交额, 买1-5价/量, 卖1-5价/量
+// parseQuotes 解析实时行情响应（对齐 pytdx GetSecurityQuotesCmd.parseResponse）
 func parseQuotes(data []byte, market uint16, codes []string) ([]QuoteData, error) {
-	if len(data) == 0 {
+	if len(data) < 4 {
 		return nil, nil
 	}
-
-	// 通达信行情每只股票固定长度 (pytdx 中每个股票约 420 字节)
-	// 安全检查
-	if len(data) < 100 {
-		return nil, fmt.Errorf("行情数据太短: %d 字节", len(data))
+	// 跳过前 2 字节标记（b1 cb），随后 2 字节为股票数
+	pos := 2
+	if len(data) < pos+2 {
+		return nil, nil
 	}
-
-	// pytdx 中 stock_quotes 每条记录的大小约为 400-420 字节
-	const quoteSize = 420
+	numStock := int(binary.LittleEndian.Uint16(data[pos : pos+2]))
+	pos += 2
 
 	var quotes []QuoteData
-	_ = codes // 实际解析时会用到
-
-	for i := 0; i < len(data)/quoteSize && i < len(codes); i++ {
-		off := i * quoteSize
-		if off+quoteSize > len(data) {
+	for i := 0; i < numStock; i++ {
+		if pos+9 > len(data) {
 			break
 		}
-		raw := data[off : off+quoteSize]
+		mkt := int(data[pos])
+		codeRaw := string(data[pos+1 : pos+7])
+		pos += 9 // <B6sH：market(1) + code(6) + active1(2)
 
+		price := getPriceAt(data, &pos)
+		lastCloseDiff := getPriceAt(data, &pos)
+		openDiff := getPriceAt(data, &pos)
+		highDiff := getPriceAt(data, &pos)
+		lowDiff := getPriceAt(data, &pos)
+		getPriceAt(data, &pos) // reversed_bytes0 (servertime)
+		getPriceAt(data, &pos) // reversed_bytes1
+		vol := getPriceAt(data, &pos)
+		getPriceAt(data, &pos) // cur_vol
+		if pos+4 > len(data) {
+			break
+		}
+		amountRaw := binary.LittleEndian.Uint32(data[pos : pos+4])
+		pos += 4
+		amount := getVolume(amountRaw)
+		getPriceAt(data, &pos) // s_vol
+		getPriceAt(data, &pos) // b_vol
+		getPriceAt(data, &pos) // reversed_bytes2
+		getPriceAt(data, &pos) // reversed_bytes3
+
+		bid1 := getPriceAt(data, &pos)
+		ask1 := getPriceAt(data, &pos)
+		bidVol1 := getPriceAt(data, &pos)
+		askVol1 := getPriceAt(data, &pos)
+		bid2 := getPriceAt(data, &pos)
+		ask2 := getPriceAt(data, &pos)
+		bidVol2 := getPriceAt(data, &pos)
+		askVol2 := getPriceAt(data, &pos)
+		bid3 := getPriceAt(data, &pos)
+		ask3 := getPriceAt(data, &pos)
+		bidVol3 := getPriceAt(data, &pos)
+		askVol3 := getPriceAt(data, &pos)
+		bid4 := getPriceAt(data, &pos)
+		ask4 := getPriceAt(data, &pos)
+		bidVol4 := getPriceAt(data, &pos)
+		askVol4 := getPriceAt(data, &pos)
+		bid5 := getPriceAt(data, &pos)
+		ask5 := getPriceAt(data, &pos)
+		bidVol5 := getPriceAt(data, &pos)
+		askVol5 := getPriceAt(data, &pos)
+
+		if pos+2 > len(data) {
+			break
+		}
+		pos += 2 // reversed_bytes4 (uint16)
+		getPriceAt(data, &pos)
+		getPriceAt(data, &pos)
+		getPriceAt(data, &pos)
+		getPriceAt(data, &pos)
+		if pos+4 > len(data) {
+			break
+		}
+		pos += 4 // reversed_bytes9 (int16) + active2 (uint16)
+
+		code := strings.TrimRight(codeRaw, "\x00")
 		q := QuoteData{
-			Market: int(market),
-			Code:   codes[i],
+			Market:    mkt,
+			Code:      code,
+			Price:     float64(price) / 100.0,
+			LastClose: float64(price+lastCloseDiff) / 100.0,
+			Open:      float64(price+openDiff) / 100.0,
+			High:      float64(price+highDiff) / 100.0,
+			Low:       float64(price+lowDiff) / 100.0,
+			Volume:    float64(vol),
+			Amount:    amount,
+			BuyPrices: [5]float64{
+				float64(price+bid1) / 100.0,
+				float64(price+bid2) / 100.0,
+				float64(price+bid3) / 100.0,
+				float64(price+bid4) / 100.0,
+				float64(price+bid5) / 100.0,
+			},
+			BuyVolumes: [5]float64{float64(bidVol1), float64(bidVol2), float64(bidVol3), float64(bidVol4), float64(bidVol5)},
+			SellPrices: [5]float64{
+				float64(price+ask1) / 100.0,
+				float64(price+ask2) / 100.0,
+				float64(price+ask3) / 100.0,
+				float64(price+ask4) / 100.0,
+				float64(price+ask5) / 100.0,
+			},
+			SellVolumes: [5]float64{float64(askVol1), float64(askVol2), float64(askVol3), float64(askVol4), float64(askVol5)},
 		}
-
-		// 跳过前 20 字节（市场/代码等）
-		// 价格字段从偏移 20 开始 (pytdx 格式)
-
-		// 字段映射 (与 pytdx 对齐):
-		// 偏移 4: 昨收 (int32, 分)
-		// 偏移 8: 今开
-		// 偏移 12: 最高
-		// 偏移 16: 最低
-		// 偏移 20: 最新价
-		// 偏移 28: 成交量
-		// ...
-
-		if len(raw) >= 48 {
-			q.LastClose = float64(int32(binary.LittleEndian.Uint32(raw[4:8]))) / 100.0
-			q.Open = float64(int32(binary.LittleEndian.Uint32(raw[8:12]))) / 100.0
-			q.High = float64(int32(binary.LittleEndian.Uint32(raw[12:16]))) / 100.0
-			q.Low = float64(int32(binary.LittleEndian.Uint32(raw[16:20]))) / 100.0
-			q.Price = float64(int32(binary.LittleEndian.Uint32(raw[20:24]))) / 100.0
-
-			// 成交量/成交额
-			if len(raw) >= 36 {
-				q.Volume = float64(binary.LittleEndian.Uint32(raw[28:32]))
-				q.Amount = float64(float32(binary.LittleEndian.Uint32(raw[32:36])))
-			}
-
-			// 五档买卖盘口 (从偏移 80 附近开始)
-			if len(raw) >= 220 {
-				for j := 0; j < 5; j++ {
-					base := 80 + j*20
-					if base+16 <= len(raw) {
-						q.BuyPrices[j] = float64(int32(binary.LittleEndian.Uint32(raw[base:base+4]))) / 100.0
-						q.BuyVolumes[j] = float64(binary.LittleEndian.Uint32(raw[base+4 : base+8]))
-						q.SellPrices[j] = float64(int32(binary.LittleEndian.Uint32(raw[base+8 : base+12]))) / 100.0
-						q.SellVolumes[j] = float64(binary.LittleEndian.Uint32(raw[base+12 : base+16]))
-					}
-				}
-			}
-		}
-
 		quotes = append(quotes, q)
 	}
 
@@ -496,11 +620,6 @@ func ResolveMarket(code string) int {
 }
 
 // CategoryForPeriod 根据周期字符串返回 category
-//
-//	"1min" → CategoryKLine1Min, "5min" → CategoryKLine5Min,
-//	"15min" → CategoryKLine15Min, "30min" → CategoryKLine30Min,
-//	"60min" → CategoryKLine1Hour, "day" → CategoryKLineDay,
-//	"week" → CategoryKLineWeek, "month" → CategoryKLineMonth
 func CategoryForPeriod(period string) uint16 {
 	switch period {
 	case "1min":
