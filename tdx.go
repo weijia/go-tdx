@@ -5,7 +5,8 @@
 //   - 请求帧：单帧 struct.pack("<HIHHHH6sHHHHIIH" / "<HIHHIIHH+<B6s>...")，无额外 16 字节封装。
 //   - 响应帧：16 字节头 + 体；体长度取 header[12:14](uint16 zipsize)，
 //     header[14:16] 为 unzipsize；zipsize != unzipsize 时体为 zlib 压缩，需解压。
-//   - 行情/分时均以"差异增量"编码（get_price 变长整数），价格按 /1000（K线）或 /100（实时）还原。
+//   - 行情/分时均以"差异增量"编码（get_price 变长整数），价格按 /1000（K线、基金五档）
+//     或 /100（股票五档）还原；基金/ETF 用 3 位小数，与股票的 2 位小数不同。
 //
 // 直连通达信行情服务器 7709 端口，支持 K线（日/周/月/分钟）与实时五档行情。
 package tdx
@@ -518,6 +519,14 @@ func parseQuotes(data []byte, market uint16, codes []string) ([]QuoteData, error
 		codeRaw := string(data[pos+1 : pos+7])
 		pos += 9 // <B6sH：market(1) + code(6) + active1(2)
 
+		// 通达信五档行情：股票价格整数为「分」(/100)，基金/ETF 为「厘」(/1000)。
+		// 统一按 /100 会把 ETF 价格放大 10 倍（如 159373: 1.184 → 11.84）。
+		code := strings.TrimRight(codeRaw, "\x00")
+		div := 100.0
+		if isFundCode(code) {
+			div = 1000.0
+		}
+
 		price := getPriceAt(data, &pos)
 		lastCloseDiff := getPriceAt(data, &pos)
 		openDiff := getPriceAt(data, &pos)
@@ -572,31 +581,30 @@ func parseQuotes(data []byte, market uint16, codes []string) ([]QuoteData, error
 		}
 		pos += 4 // reversed_bytes9 (int16) + active2 (uint16)
 
-		code := strings.TrimRight(codeRaw, "\x00")
 		q := QuoteData{
 			Market:    mkt,
 			Code:      code,
-			Price:     float64(price) / 100.0,
-			LastClose: float64(price+lastCloseDiff) / 100.0,
-			Open:      float64(price+openDiff) / 100.0,
-			High:      float64(price+highDiff) / 100.0,
-			Low:       float64(price+lowDiff) / 100.0,
+			Price:     float64(price) / div,
+			LastClose: float64(price+lastCloseDiff) / div,
+			Open:      float64(price+openDiff) / div,
+			High:      float64(price+highDiff) / div,
+			Low:       float64(price+lowDiff) / div,
 			Volume:    float64(vol),
 			Amount:    amount,
 			BuyPrices: [5]float64{
-				float64(price+bid1) / 100.0,
-				float64(price+bid2) / 100.0,
-				float64(price+bid3) / 100.0,
-				float64(price+bid4) / 100.0,
-				float64(price+bid5) / 100.0,
+				float64(price+bid1) / div,
+				float64(price+bid2) / div,
+				float64(price+bid3) / div,
+				float64(price+bid4) / div,
+				float64(price+bid5) / div,
 			},
 			BuyVolumes: [5]float64{float64(bidVol1), float64(bidVol2), float64(bidVol3), float64(bidVol4), float64(bidVol5)},
 			SellPrices: [5]float64{
-				float64(price+ask1) / 100.0,
-				float64(price+ask2) / 100.0,
-				float64(price+ask3) / 100.0,
-				float64(price+ask4) / 100.0,
-				float64(price+ask5) / 100.0,
+				float64(price+ask1) / div,
+				float64(price+ask2) / div,
+				float64(price+ask3) / div,
+				float64(price+ask4) / div,
+				float64(price+ask5) / div,
 			},
 			SellVolumes: [5]float64{float64(askVol1), float64(askVol2), float64(askVol3), float64(askVol4), float64(askVol5)},
 		}
@@ -607,6 +615,20 @@ func parseQuotes(data []byte, market uint16, codes []string) ([]QuoteData, error
 }
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
+
+// isFundCode 判断是否为基金类证券（ETF / LOF）。
+// 通达信五档行情对基金使用 3 位小数（厘），与股票的 2 位小数（分）不同；
+// 实测覆盖：深市 15/16、沪市 50/51/52/56/58。可转债 11/12/13 不在其列。
+func isFundCode(code string) bool {
+	if len(code) < 2 {
+		return false
+	}
+	switch code[:2] {
+	case "15", "16", "50", "51", "52", "56", "58":
+		return true
+	}
+	return false
+}
 
 // ResolveMarket 根据股票代码判断市场
 func ResolveMarket(code string) int {
