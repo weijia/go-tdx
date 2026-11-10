@@ -135,8 +135,13 @@ func (c *Client) Connect() error {
 	// TDX 登录握手：部分券商行情服务器要求在发送任何行情请求前先完成握手，
 	// 否则会在首个数据请求时直接断开连接（表现为 EOF）。包内容来自 pytdx 实测抓包。
 	if err := c.setupHandshake(); err != nil {
-		c.conn.Close()
-		c.conn = nil
+		// readResponse 读失败时会自行 Close 并把 c.conn 置为 nil，此处必须判空：
+		// 对 nil 的 net.Conn 调用 Close 会 panic，而 Benchmark 的测速协程里未捕获的
+		// panic 会直接终止整个宿主进程（曾导致 price server 在休眠唤醒后退出）。
+		if c.conn != nil {
+			c.conn.Close()
+			c.conn = nil
+		}
 		return fmt.Errorf("TDX 握手失败: %w", err)
 	}
 	return nil
@@ -156,6 +161,9 @@ var tdxHandshakePackets = [][]byte{
 
 // setupHandshake 发送 TDX 登录握手包并消费服务器响应，保持 TCP 流同步。
 func (c *Client) setupHandshake() error {
+	if c.conn == nil {
+		return fmt.Errorf("连接已断开，无法握手")
+	}
 	c.conn.SetDeadline(time.Now().Add(c.timeout))
 	for _, pkt := range tdxHandshakePackets {
 		if _, err := c.conn.Write(pkt); err != nil {

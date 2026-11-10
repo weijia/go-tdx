@@ -86,6 +86,20 @@ func Benchmark(timeout time.Duration) []BenchmarkResult {
 		wg.Add(1)
 		go func(a ServerAddr) {
 			defer wg.Done()
+			// 测速是后台旁路任务：单台服务器协议异常引发的 panic 绝不能
+			// 逃逸出去终止宿主进程（Go 未捕获的协程 panic 会杀掉整个进程）。
+			// 这里把它降级为该服务器测速失败，并由上方的 nil 防护根治成因。
+			defer func() {
+				if r := recover(); r != nil {
+					mu.Lock()
+					results = append(results, BenchmarkResult{
+						Addr:  a,
+						OK:    false,
+						Error: fmt.Errorf("测速协程异常: %v", r),
+					})
+					mu.Unlock()
+				}
+			}()
 
 			start := time.Now()
 			client := NewClient(a.Host, a.Port)
